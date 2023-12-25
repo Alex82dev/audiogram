@@ -1,61 +1,37 @@
 import argparse
 import random
-from configparser import ConfigParser
-from pprint import pprint
-from typing import Mapping
-
 import grpc
-from google.protobuf.json_format import MessageToDict
-from keycloak import KeycloakOpenID
+import logging
+import os
 
 import tts_pb2
 import tts_pb2_grpc
 
-
-def read_api_config(file_name: str = "config.ini") -> ConfigParser:
-    """
-    Загружает параметры соединения с API и авторизации из ini-файла.
-    Структура файла и примеры значений:
-
-    [API]
-    server_address: audiogram.mts.ai:443
-
-    [Auth]
-    sso_server_url: https://isso.mts.ru/auth/
-    realm_name: mts
-    client_id: <client id>
-    client_secret: <client secret>
-    """
-
-    config = ConfigParser()
-    config.read(file_name)
-
+def load_config(file_name: str = "config.ini") -> dict:
+    config = {}
+    parser = ConfigParser()
+    parser.read(file_name)
+    config["api"] = {"server_address": parser.get("API", "server_address")}
+    config["auth"] = {
+        "sso_server_url": parser.get("Auth", "sso_server_url"),
+        "realm_name": parser.get("Auth", "realm_name"),
+        "client_id": parser.get("Auth", "client_id"),
+        "client_secret": parser.get("Auth", "client_secret"),
+    }
     return config
 
-
-def get_request_metadata(auth_config: Mapping[str, str]) -> list[tuple[str, str]]:
-    sso_connection = KeycloakOpenID(
-        auth_config["sso_server_url"],
-        auth_config["realm_name"],
-        auth_config["client_id"],
-        auth_config["client_secret"],
-        verify=True,
-    )
-    token_info = sso_connection.token(grant_type="client_credentials")
-    access_token = token_info["access_token"]
-
-    trace_id = str(random.randint(1000, 9999))
-    print(f"Trace id: {trace_id}")
-
-    metadata = [
-        ("authorization", f"Bearer {access_token}"),
-        ("external_trace_id", trace_id),
+def get_grpc_stub(config: dict) -> tts_pb2_grpc.TTSStub:
+    credentials = grpc.ssl_channel_credentials()
+    options = [
+        ("grpc.min_reconnect_backoff_ms", 1000),
+        ("grpc.max_reconnect_backoff_ms", 1000),
+        ("grpc.max_send_message_length", -1),
+        ("grpc.max_receive_message_length", -1),
     ]
+    with grpc.secure_channel(config["api"]["server_address"], credentials=credentials, options=options) as channel:
+        return tts_pb2_grpc.TTSStub(channel)
 
-    return metadata
-
-
-def synthesize_file(text: str, api_address: str, auth_config: Mapping[str, str]):
+def synthesize_speech(text: str, stub: tts_pb2_grpc.TTSStub) -> bytes:
     request = tts_pb2.SynthesizeSpeechRequest(
         text=text,
         encoding=tts_pb2.AudioEncoding.LINEAR_PCM,
@@ -67,45 +43,17 @@ def synthesize_file(text: str, api_address: str, auth_config: Mapping[str, str])
             voice_style=tts_pb2.VoiceStyle.VOICE_STYLE_NEUTRAL,
         ),
     )
-    print("Prepared request:")
-    pprint(MessageToDict(request))
+    response = stub.Synthesize(request)
+    return response.audio
 
-    options = [
-        ("grpc.min_reconnect_backoff_ms", 1000),
-        ("grpc.max_reconnect_backoff_ms", 1000),
-        ("grpc.max_send_message_length", -1),
-        ("grpc.max_receive_message_length", -1),
-    ]
+def save_audio_to_file(audio: bytes, file_path: str):
+    with open(file_path, "wb") as f:
+        f.write(audio)
 
-    credentials = grpc.ssl_channel_credentials()
-
-    print(f"\nSending request to gRPC server {api_address}")
-
-    with grpc.secure_channel(
-        api_address, credentials=credentials, options=options
-    ) as channel:
-        stub = tts_pb2_grpc.TTSStub(channel)
-
-        request_metadata = get_request_metadata(auth_config)
-
-        response, call = stub.Synthesize.with_call(
-            request,
-            metadata=request_metadata,
-            wait_for_ready=True,
-        )
-
-        print("\nReceived response:")
-        initial_metadata = dict(call.initial_metadata())
-        print(f"request_id: {initial_metadata.get('request_id', '')}")
-        print(f"trace_id: {initial_metadata.get('external_trace_id', '')}")
-        print(f"audio: <{len(response.audio)} bytes>")
-
-        path = "synthesized_audio.wav"
-        with open(path, "wb") as f:
-            f.write(response.audio)
-
-        print(f"Saved received audio to {path}")
-
+def synthesize_and_save_audio(text: str, config: dict):
+    stub = get_grpc_stub(config)
+    audio = synthesize_speech(text, stub)
+    save_audio_to_file(audio, "synthesized_audio.wav")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -113,10 +61,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    config = read_api_config()
+    config = load_config()
 
-    synthesize_file(
-        args.text,
-        config["API"]["server_address"],
-        config["Auth"],
-    )
+    synthesize_and_save_audio(args.text, config)
